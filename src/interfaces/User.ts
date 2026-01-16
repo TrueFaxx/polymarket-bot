@@ -26,6 +26,7 @@ export interface UserActivityInterface {
     bot: boolean;
     botExcutedTime: number;
     myBoughtSize?: number; // Tracks actual tokens we bought
+    myCopiedUsd?: number; // Tracks total USD spent for this copied trade
 }
 
 export interface UserPositionInterface {

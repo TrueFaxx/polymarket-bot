@@ -63,6 +63,7 @@ const activitySchema = new Schema({
     bot: { type: Boolean, required: false },
     botExcutedTime: { type: Number, required: false },
     myBoughtSize: { type: Number, required: false }, // Tracks actual tokens we bought
+    myCopiedUsd: { type: Number, required: false }, // Tracks total USD spent for this copied trade
 });
 
 const getUserPositionModel = (walletAddress: string) => {
