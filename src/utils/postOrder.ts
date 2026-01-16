@@ -8,10 +8,6 @@ import { calculateOrderSize, getTradeMultiplier } from '../config/copyStrategy';
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
 
-// Legacy parameters (for backward compatibility in SELL logic)
-const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
-const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
-
 // Polymarket minimum order sizes
 const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
 const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
@@ -61,6 +57,24 @@ const isInsufficientBalanceOrAllowanceError = (message: string | undefined): boo
     }
     const lower = message.toLowerCase();
     return lower.includes('not enough balance') || lower.includes('allowance');
+};
+
+const getDayBounds = (referenceTimestamp: number) => {
+    const isSeconds = referenceTimestamp < 1e12;
+    const referenceDate = new Date(isSeconds ? referenceTimestamp * 1000 : referenceTimestamp);
+    const startMs = Date.UTC(
+        referenceDate.getUTCFullYear(),
+        referenceDate.getUTCMonth(),
+        referenceDate.getUTCDate()
+    );
+    const endMs = startMs + 24 * 60 * 60 * 1000;
+    const toUnit = (ms: number) => (isSeconds ? Math.floor(ms / 1000) : ms);
+
+    return {
+        start: toUnit(startMs),
+        end: toUnit(endMs),
+        unitLabel: isSeconds ? 'seconds' : 'milliseconds',
+    };
 };
 
 const postOrder = async (
@@ -196,10 +210,58 @@ const postOrder = async (
         }
 
         let remaining = orderCalc.finalAmount;
+        const dailyVolumeLimit = COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
+        if (dailyVolumeLimit && dailyVolumeLimit > 0) {
+            const { start, end, unitLabel } = getDayBounds(trade.timestamp);
+            const volumeAgg = await UserActivity.aggregate([
+                {
+                    $match: {
+                        bot: true,
+                        myCopiedUsd: { $gt: 0 },
+                        timestamp: { $gte: start, $lt: end },
+                    },
+                },
+                { $group: { _id: null, total: { $sum: '$myCopiedUsd' } } },
+            ]);
+            const usedVolume = volumeAgg[0]?.total ?? 0;
+            const remainingVolume = dailyVolumeLimit - usedVolume;
+
+            Logger.info(
+                `Daily copy volume (${unitLabel}): $${usedVolume.toFixed(2)} used / $${dailyVolumeLimit.toFixed(2)} limit`
+            );
+
+            if (remainingVolume <= 0) {
+                Logger.warning('❌ Daily copy volume limit reached - skipping buy');
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { bot: true, myCopiedUsd: 0 }
+                );
+                return;
+            }
+
+            if (remaining > remainingVolume) {
+                Logger.warning(
+                    `⚠️  Capping buy to remaining daily volume: $${remainingVolume.toFixed(2)}`
+                );
+                remaining = remainingVolume;
+            }
+
+            if (remaining < COPY_STRATEGY_CONFIG.minOrderSizeUSD) {
+                Logger.warning(
+                    `❌ Remaining daily volume ($${remaining.toFixed(2)}) below minimum order size`
+                );
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { bot: true, myCopiedUsd: 0 }
+                );
+                return;
+            }
+        }
 
         let retry = 0;
         let abortDueToFunds = false;
         let totalBoughtTokens = 0; // Track total tokens bought for this trade
+        let totalSpentUsd = 0; // Track total USD spent for this trade
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
@@ -252,6 +314,7 @@ const postOrder = async (
                 retry = 0;
                 const tokensBought = order_arges.amount / order_arges.price;
                 totalBoughtTokens += tokensBought;
+                totalSpentUsd += order_arges.amount;
                 Logger.orderResult(
                     true,
                     `Bought $${order_arges.amount.toFixed(2)} at $${order_arges.price} (${tokensBought.toFixed(2)} tokens)`
@@ -278,19 +341,29 @@ const postOrder = async (
         if (abortDueToFunds) {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, botExcutedTime: RETRY_LIMIT, myBoughtSize: totalBoughtTokens }
+                {
+                    bot: true,
+                    botExcutedTime: RETRY_LIMIT,
+                    myBoughtSize: totalBoughtTokens,
+                    myCopiedUsd: totalSpentUsd,
+                }
             );
             return;
         }
         if (retry >= RETRY_LIMIT) {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, botExcutedTime: retry, myBoughtSize: totalBoughtTokens }
+                {
+                    bot: true,
+                    botExcutedTime: retry,
+                    myBoughtSize: totalBoughtTokens,
+                    myCopiedUsd: totalSpentUsd,
+                }
             );
         } else {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, myBoughtSize: totalBoughtTokens }
+                { bot: true, myBoughtSize: totalBoughtTokens, myCopiedUsd: totalSpentUsd }
             );
         }
 
